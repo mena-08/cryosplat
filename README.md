@@ -62,10 +62,18 @@ conda install pytorch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 pytorch-cuda=
 conda install pytorch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 pytorch-cuda=12.1 -c pytorch -c nvidia
 ```
 
-Verify the installation:
+**Using Miniforge (conda-forge only)?** The `pytorch` channel's CUDA builds depend on
+Anaconda's `defaults` channel. Without it, conda silently installs a CPU-only PyTorch.
+Install the official pip wheels instead (use `cu118` for CUDA 11.8):
 
 ```
-python -c "import torch; print(torch.__version__, torch.version.cuda)"
+pip install torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 --index-url https://download.pytorch.org/whl/cu121
+```
+
+Verify the installation (it should print a CUDA version and `True`):
+
+```
+python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())"
 ```
 
 ### 4. Install the differentiable GMM renderer

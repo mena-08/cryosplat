@@ -18,5 +18,6 @@
 #define NUM_CHANNELS 1 // Default 1, only amplitudes
 #define BLOCK_X 16
 #define BLOCK_Y 16
+#define RENDER_SPLITS 32 // Blocks that share each tile's Gaussian list in the render kernels
 
 #endif

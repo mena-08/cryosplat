@@ -222,6 +222,16 @@ renderCUDA(
 
 	// Load start/end range of IDs to process in bit sorted list.
 	uint2 range = ranges[block.group_index().y * horizontal_blocks + block.group_index().x];
+
+	// Split this tile's Gaussian list across gridDim.z blocks, so that tiles with
+	// many Gaussians don't leave the rest of the GPU idle.
+	{
+		const uint32_t len = range.y - range.x;
+		const uint32_t per = (len + gridDim.z - 1) / gridDim.z;
+		const uint32_t start = min(len, block.group_index().z * per);
+		const uint32_t end = min(len, start + per);
+		range = { range.x + start, range.x + end };
+	}
 	const int rounds = ((range.y - range.x + BLOCK_SIZE - 1) / BLOCK_SIZE);
 	int toDo = range.y - range.x;
 
@@ -229,6 +239,7 @@ renderCUDA(
 	__shared__ int collected_id[BLOCK_SIZE];
 	__shared__ float2 collected_xy[BLOCK_SIZE];
 	__shared__ float4 collected_conic_amplitude[BLOCK_SIZE];
+	__shared__ float collected_norm[BLOCK_SIZE];
 
 	// Initialize helper variables
 	// No transmittance ratio in cryo-EM
@@ -251,7 +262,12 @@ renderCUDA(
 			int coll_id = point_list[range.x + progress];
 			collected_id[block.thread_rank()] = coll_id;
 			collected_xy[block.thread_rank()] = points_xy_image[coll_id];
-			collected_conic_amplitude[block.thread_rank()] = conic_amplitude[coll_id];
+			const float4 con_a = conic_amplitude[coll_id];
+			collected_conic_amplitude[block.thread_rank()] = con_a;
+
+			// Eq. (8) from cryoSplat paper: 1/(2*pi*sqrt(det)), computed once per
+			// Gaussian here instead of for every pixel.
+			collected_norm[block.thread_rank()] = 0.15915494309189535 * sqrt(con_a.x * con_a.z - con_a.y * con_a.y);
 		}
 		block.sync();
 
@@ -270,8 +286,7 @@ renderCUDA(
 			if (power > 0.0f)
 				continue;
 
-			// Eq. (8) from cryoSplat paper.
-			const float norm = 0.15915494309189535 * sqrt(con_a.x * con_a.z - con_a.y * con_a.y); // 1/(2*pi*sqrt(det))
+			const float norm = collected_norm[j];
 			float alpha = con_a.w * norm * exp(power);
 
 			// Eq. (14) from cryoSplat paper.
@@ -290,7 +305,10 @@ renderCUDA(
 	// rendering data to the frame and auxiliary buffers.
 	if (inside)
 	{
-		out_pixel[pix_id] = Q;
+		if (gridDim.z == 1)
+			out_pixel[pix_id] = Q;
+		else
+			atomicAdd(&out_pixel[pix_id], Q); // partial sum of this block's share
 	}
 }
 

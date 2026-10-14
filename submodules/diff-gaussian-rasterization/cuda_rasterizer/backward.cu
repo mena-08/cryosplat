@@ -263,7 +263,17 @@ renderCUDA(
 	const float2 pixf = { (float)pix.x, (float)pix.y };
 
 	const bool inside = pix.x < W&& pix.y < H;
-	const uint2 range = ranges[block.group_index().y * horizontal_blocks + block.group_index().x];
+	uint2 range = ranges[block.group_index().y * horizontal_blocks + block.group_index().x];
+
+	// Split this tile's Gaussian list across gridDim.z blocks, so that tiles with
+	// many Gaussians don't leave the rest of the GPU idle.
+	{
+		const uint32_t len = range.y - range.x;
+		const uint32_t per = (len + gridDim.z - 1) / gridDim.z;
+		const uint32_t start = min(len, block.group_index().z * per);
+		const uint32_t end = min(len, start + per);
+		range = { range.x + start, range.x + end };
+	}
 
 	const int rounds = ((range.y - range.x + BLOCK_SIZE - 1) / BLOCK_SIZE);
 
@@ -273,6 +283,8 @@ renderCUDA(
 	__shared__ int collected_id[BLOCK_SIZE];
 	__shared__ float2 collected_xy[BLOCK_SIZE]; // screen-space
 	__shared__ float4 collected_conic_amplitude[BLOCK_SIZE]; //screen-space
+	__shared__ float collected_det[BLOCK_SIZE];
+	__shared__ float collected_norm[BLOCK_SIZE];
 
 	// float accum_rec = 0 ;
 	float dL_dpixel;
@@ -286,6 +298,8 @@ renderCUDA(
 	const float ddelx_dx = 0.5 * W;
 	const float ddely_dy = 0.5 * H;
 
+	const int lane = block.thread_rank() & 31;
+
 	// Traverse all Gaussians
 	for (int i = 0; i < rounds; i++, toDo -= BLOCK_SIZE)
 	{
@@ -298,49 +312,78 @@ renderCUDA(
 			const int coll_id = point_list[range.y - progress - 1];
 			collected_id[block.thread_rank()] = coll_id;
 			collected_xy[block.thread_rank()] = points_xy_image[coll_id];
-			collected_conic_amplitude[block.thread_rank()] = conic_amplitude[coll_id];
+			const float4 con_a = conic_amplitude[coll_id];
+			collected_conic_amplitude[block.thread_rank()] = con_a;
+
+			// Per-Gaussian terms, computed once here instead of for every pixel
+			const float det_inv = con_a.x * con_a.z - con_a.y * con_a.y; // det(conic)
+			collected_det[block.thread_rank()] = 1.f / (det_inv + 0.0000001f); // det(cov2D)
+			collected_norm[block.thread_rank()] = 0.15915494309189535 * sqrt(det_inv); // 1/(2*pi*sqrt(det))
 		}
 		block.sync();
 
-		// Iterate over Gaussians
-		for (int j = 0; !done && j < min(BLOCK_SIZE, toDo); j++)
+		// Iterate over Gaussians. Every lane of a warp runs every iteration (pixels
+		// outside the image contribute zero), so each Gaussian's gradients can be summed
+		// across the warp with shuffles and committed with one atomicAdd per warp
+		// instead of one per pixel, which removes most of the atomic contention.
+		const int batch = min(BLOCK_SIZE, toDo);
+		for (int j = 0; j < batch; j++)
 		{
-
 			// Compute blending values, as before.
 			const float2 xy = collected_xy[j];
 			const float2 d = { xy.x - pixf.x, xy.y - pixf.y };
 			const float4 con_a = collected_conic_amplitude[j];
 			const float power = -0.5f * (con_a.x * d.x * d.x + con_a.z * d.y * d.y) - con_a.y * d.x * d.y;
-			if (power > 0.0f)
-				continue;
 
-			const float det_inv = con_a.x * con_a.z - con_a.y * con_a.y; // det(conic)
-			const float det = 1.f / (det_inv + 0.0000001f); // det(cov2D)
-			const float norm = 0.15915494309189535 * sqrt(det_inv); // 1/(2*pi*sqrt(det))
-			const float G = norm * exp(power);
-			const float alpha = con_a.w * G;
+			float g_mean_x = 0.f, g_mean_y = 0.f;
+			float g_conic_x = 0.f, g_conic_y = 0.f, g_conic_z = 0.f;
+			float g_amplitude = 0.f;
+			if (!done && !(power > 0.0f))
+			{
+				const float det = collected_det[j];
+				const float norm = collected_norm[j];
+				const float G = norm * exp(power);
 
+				// Helpful reusable temporary variables
+				const float dL_dG = con_a.w * dL_dpixel;
+				const float gdx = G * d.x;
+				const float gdy = G * d.y;
+				const float dG_ddelx = -gdx * con_a.x - gdy * con_a.y;
+				const float dG_ddely = -gdy * con_a.z - gdx * con_a.y;
 
-			const int global_id = collected_id[j];
+				// Gradients w.r.t. 2D mean position of the Gaussian
+				g_mean_x = dL_dG * dG_ddelx * ddelx_dx;
+				g_mean_y = dL_dG * dG_ddely * ddely_dy;
 
-			// Helpful reusable temporary variables
-			const float dL_dG = con_a.w * dL_dpixel;
-			const float gdx = G * d.x;
-			const float gdy = G * d.y;
-			const float dG_ddelx = -gdx * con_a.x - gdy * con_a.y;
-			const float dG_ddely = -gdy * con_a.z - gdx * con_a.y;
+				// Gradients w.r.t. 2D covariance (2x2 matrix, symmetric)
+				g_conic_x = 0.5f * G * (det * con_a.z - d.x * d.x) * dL_dG;
+				g_conic_y = 0.5f * G * (det * -con_a.y - d.x * d.y) * dL_dG;
+				g_conic_z = 0.5f * G * (det * con_a.x - d.y * d.y) * dL_dG;
 
-			// Update gradients w.r.t. 2D mean position of the Gaussian
-			atomicAdd(&dL_dmean2D[global_id].x, dL_dG * dG_ddelx * ddelx_dx);
-			atomicAdd(&dL_dmean2D[global_id].y, dL_dG * dG_ddely * ddely_dy);
+				// Gradient w.r.t. amplitude of the Gaussian
+				g_amplitude = G * dL_dpixel;
+			}
 
-			// Update gradients w.r.t. 2D covariance (2x2 matrix, symmetric)
-			atomicAdd(&dL_dconic2D[global_id].x, 0.5f * G * (det * con_a.z - d.x * d.x) * dL_dG);
-			atomicAdd(&dL_dconic2D[global_id].y, 0.5f * G * (det * -con_a.y - d.x * d.y) * dL_dG);
-			atomicAdd(&dL_dconic2D[global_id].z, 0.5f * G * (det * con_a.x - d.y * d.y) * dL_dG);
+			for (int offset = 16; offset > 0; offset /= 2)
+			{
+				g_mean_x += __shfl_down_sync(0xffffffff, g_mean_x, offset);
+				g_mean_y += __shfl_down_sync(0xffffffff, g_mean_y, offset);
+				g_conic_x += __shfl_down_sync(0xffffffff, g_conic_x, offset);
+				g_conic_y += __shfl_down_sync(0xffffffff, g_conic_y, offset);
+				g_conic_z += __shfl_down_sync(0xffffffff, g_conic_z, offset);
+				g_amplitude += __shfl_down_sync(0xffffffff, g_amplitude, offset);
+			}
 
-			// Update gradients w.r.t. amplitude of the Gaussian
-			atomicAdd(&(dL_damplitude[global_id]), G * dL_dpixel);
+			if (lane == 0)
+			{
+				const int global_id = collected_id[j];
+				atomicAdd(&dL_dmean2D[global_id].x, g_mean_x);
+				atomicAdd(&dL_dmean2D[global_id].y, g_mean_y);
+				atomicAdd(&dL_dconic2D[global_id].x, g_conic_x);
+				atomicAdd(&dL_dconic2D[global_id].y, g_conic_y);
+				atomicAdd(&dL_dconic2D[global_id].z, g_conic_z);
+				atomicAdd(&(dL_damplitude[global_id]), g_amplitude);
+			}
 		}
 	}
 }

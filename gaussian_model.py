@@ -23,6 +23,53 @@ from plyfile import PlyData, PlyElement
 
 from tqdm import tqdm
 
+try:
+    import triton
+    import triton.language as tl
+except ImportError:  # generate_volume falls back to the per-Gaussian loop
+    triton = None
+
+if triton is not None:
+    @triton.jit
+    def _gmm_volume_kernel(
+        grid_ptr, mu_ptr, inv_cov_ptr, coef_ptr, out_ptr,
+        P, N,
+        BLOCK_V: tl.constexpr, BLOCK_G: tl.constexpr,
+    ):
+        # Each program sums every Gaussian at BLOCK_V voxels, keeping the running
+        # sum in registers (the same math as the loop in generate_volume, fused).
+        pid = tl.program_id(0)
+        v = pid * BLOCK_V + tl.arange(0, BLOCK_V)
+        v_mask = v < N * N * N
+        # voxel (z, y, x) -> coordinate (x, y, z), matching meshgrid(indexing="ij")
+        x = tl.load(grid_ptr + v % N, mask=v_mask, other=0.0)
+        y = tl.load(grid_ptr + (v // N) % N, mask=v_mask, other=0.0)
+        z = tl.load(grid_ptr + v // (N * N), mask=v_mask, other=0.0)
+
+        acc = tl.zeros((BLOCK_V,), dtype=tl.float32)
+        for g0 in range(0, P, BLOCK_G):
+            g = g0 + tl.arange(0, BLOCK_G)
+            g_mask = g < P
+            mx = tl.load(mu_ptr + g * 3 + 0, mask=g_mask, other=0.0)
+            my = tl.load(mu_ptr + g * 3 + 1, mask=g_mask, other=0.0)
+            mz = tl.load(mu_ptr + g * 3 + 2, mask=g_mask, other=0.0)
+            s00 = tl.load(inv_cov_ptr + g * 6 + 0, mask=g_mask, other=0.0)
+            s01 = tl.load(inv_cov_ptr + g * 6 + 1, mask=g_mask, other=0.0)
+            s02 = tl.load(inv_cov_ptr + g * 6 + 2, mask=g_mask, other=0.0)
+            s11 = tl.load(inv_cov_ptr + g * 6 + 3, mask=g_mask, other=0.0)
+            s12 = tl.load(inv_cov_ptr + g * 6 + 4, mask=g_mask, other=0.0)
+            s22 = tl.load(inv_cov_ptr + g * 6 + 5, mask=g_mask, other=0.0)
+            c = tl.load(coef_ptr + g, mask=g_mask, other=0.0)
+
+            dx = x[:, None] - mx[None, :]
+            dy = y[:, None] - my[None, :]
+            dz = z[:, None] - mz[None, :]
+            q = (s00[None, :] * dx * dx + s11[None, :] * dy * dy + s22[None, :] * dz * dz
+                 + 2.0 * (s01[None, :] * dx * dy + s02[None, :] * dx * dz + s12[None, :] * dy * dz))
+            acc += tl.sum(c[None, :] * tl.exp(-0.5 * q), axis=1)
+
+        tl.store(out_ptr + v, acc, mask=v_mask)
+
 def inverse_sigmoid(x):
     return torch.log(x/(1-x))
 
@@ -276,6 +323,9 @@ class GaussianModel:
     
     def generate_volume(self, D=257, extent=0.5, norm=[0, 1]):
         assert D % 2 == 1
+        if triton is not None:
+            return self._generate_volume_fused(D, extent, norm)
+
         dimension = torch.linspace(-extent, extent, D, device='cuda')[0: -1]
         z, y, x = torch.meshgrid([dimension, dimension, dimension], indexing="ij")
         coords = torch.stack([x.flatten(), y.flatten(), z.flatten()], dim=-1)
@@ -300,3 +350,25 @@ class GaussianModel:
         volume = volume.reshape((D-1, D-1, D-1)) * norm[1]
 
         return volume
+
+    @torch.no_grad()
+    def _generate_volume_fused(self, D, extent, norm, block_v=128, block_g=32):
+        N = D - 1
+        dimension = torch.linspace(-extent, extent, D, device='cuda')[0: -1].contiguous()
+        mu = self.get_xyz.detach()
+        inv_cov = self.get_inv_covariance().detach()
+        amp = self.get_amplitude.detach().reshape(-1)
+        coef = amp * torch.sqrt(self.get_det_inv_covariance().detach()) / ((2 * torch.pi)**1.5)
+
+        # Like the loop above, skip Gaussians whose density would contain NaNs
+        valid = torch.isfinite(mu).all(1) & torch.isfinite(inv_cov).all(1) & torch.isfinite(coef)
+        mu = torch.where(valid[:, None], mu, 0.0).contiguous()
+        inv_cov = torch.where(valid[:, None], inv_cov, 0.0).contiguous()
+        coef = torch.where(valid, coef, 0.0).contiguous()
+
+        volume = torch.empty(N**3, device='cuda')
+        _gmm_volume_kernel[(triton.cdiv(N**3, block_v),)](
+            dimension, mu, inv_cov, coef, volume, mu.shape[0], N,
+            BLOCK_V=block_v, BLOCK_G=block_g,
+        )
+        return volume.reshape((N, N, N)) * norm[1]

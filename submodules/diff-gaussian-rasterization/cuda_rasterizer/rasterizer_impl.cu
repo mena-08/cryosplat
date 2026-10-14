@@ -299,7 +299,7 @@ int CudaRasterizer::Rasterizer::forward(
 
 	// Let each tile blend its range of Gaussians independently in parallel
 	CHECK_CUDA(FORWARD::render(
-		tile_grid, block,
+		dim3(tile_grid.x, tile_grid.y, RENDER_SPLITS), block,
 		imgState.ranges,
 		binningState.point_list,
 		width, height,
@@ -356,7 +356,7 @@ void CudaRasterizer::Rasterizer::backward(
 	// opacity and RGB of Gaussians from per-pixel loss gradients.
 	// If we were given precomputed colors and not SHs, use them.
 	CHECK_CUDA(BACKWARD::render(
-		tile_grid,
+		dim3(tile_grid.x, tile_grid.y, RENDER_SPLITS),
 		block,
 		imgState.ranges,
 		binningState.point_list,

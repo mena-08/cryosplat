@@ -29,7 +29,10 @@ Outputs
 import os
 import sys
 import time
+import queue
 import random
+import multiprocessing as mp
+from concurrent.futures import ProcessPoolExecutor
 import numpy as np
 import torch
 import torch.nn as nn
@@ -230,6 +233,12 @@ def add_args(parser):
         help="Shuffle the dataset at the end of every epoch",
     )
     group.add_argument(
+        "--split-models",
+        action="store_true",
+        help="Train the full model on the first GPU and the two half-map models on the second, "
+        "in a separate process (same results, about twice as fast; needs two GPUs)",
+    )
+    group.add_argument(
         "--seed",
         type=int,
         default=42,
@@ -254,7 +263,80 @@ def apply_ctf_centered(proj_spatial_centered, ctf_freq_centered):
 
     return proj_ctf_applied
 
-def main(args):
+def prepare_images(img_iterator, data, lattice, posetracker, ctf_params, window, args, device, chunk_size=256):
+    """
+    Yield (index, rotation, ground-truth image, CTF) for each particle in img_iterator.
+
+    Particles are prepared a chunk at a time with batched GPU operations: Hartley
+    transform, phase shift by the pose translation, inverse transform back to real
+    space, and the CTF. These are the same steps as preparing one image at a time, but
+    the training loop no longer waits on per-image CPU work and small GPU kernels.
+    """
+    D = data.D
+    for c0 in range(0, len(img_iterator), chunk_size):
+        chunk = img_iterator[c0:c0 + chunk_size]
+        B = len(chunk)
+        ind = torch.tensor(chunk, device=device)
+        rots, trans = posetracker.get_pose(ind)
+
+        if args.tilt:
+            ff = torch.cat([data.get_tilt(ii)[0] for ii in chunk])
+        else:
+            ff = data[chunk][0]
+        ff = ff.to(device).view(B, D, D)
+
+        if trans is not None:
+            ff = lattice.translate_ht(ff.view(B, -1), trans.view(B, 1, 2)).view(B, D, D)
+
+        # Move to real space
+        gt_images = fft.iht2_center(ff[:, 0:-1, 0:-1])
+
+        if args.window and window is not None:
+            gt_images *= window
+
+        ctf_muls = None
+        if ctf_params is not None:
+            params = ctf_params[ind]
+            freqs = lattice.freqs2d.unsqueeze(0) / params[:, 0].view(B, 1, 1)
+            ctf_muls = ctf.compute_ctf(freqs, *torch.split(params[:, 1:], 1, 1)).view(B, D, D)
+
+        for k, ii in enumerate(chunk):
+            yield ii, rots[k], gt_images[k], ctf_muls[k] if ctf_muls is not None else 1
+
+def fsc_worker(seed, *args, **kwargs):
+    """Compute FSCs in a background process, so training continues meanwhile."""
+    np.random.seed(seed)  # phase randomization in the corrected FSC draws from np.random
+    return calculate_cryosparc_fscs(*args, **kwargs)
+
+class HalfMapsLogPrefix(logging.Filter):
+    """Mark log lines written by the half-map process when using --split-models."""
+    def filter(self, record):
+        record.msg = f"[half-maps] {record.msg}"
+        return True
+
+def main(args, role="all", half_maps_queue=None):
+    """
+    `role` is "all" to train every model in this process. With --split-models, the main
+    process trains the full model ("full") and starts a second process on the second GPU
+    for the two half-map models ("halves"), which sends its half-maps back for the FSC.
+    """
+    half_maps_worker = None
+    if role == "all" and args.split_models:
+        if not args.half_maps:
+            raise ValueError("--split-models trains the half-maps on the second GPU; drop --no-half-maps")
+        if torch.cuda.device_count() < 2:
+            raise RuntimeError("--split-models needs two visible GPUs")
+        ctx = mp.get_context("spawn")
+        half_maps_queue = ctx.Queue()
+        half_maps_worker = ctx.Process(target=main, args=(args, "halves", half_maps_queue), daemon=True)
+        half_maps_worker.start()
+        role = "full"
+    if role == "halves":
+        torch.cuda.set_device(1)
+        logger.addFilter(HalfMapsLogPrefix())
+    train_full = role in ("all", "full")
+    train_halves = args.half_maps and role in ("all", "halves")
+
     set_seed(args.seed)
 
     if args.outdir is not None and not os.path.exists(args.outdir):
@@ -347,13 +429,14 @@ def main(args):
     else:
         window = None
 
-    # Initialize gaussians
+    # Initialize gaussians. The full model is always created first, so the half-map models
+    # start from the same random draws whether or not they train in a separate process.
     img_count = len(img_iterator)
     gaussian_full = GaussianModel()
     gaussian_full.initialize_gaussians_random(P=args.num_points)
     gaussian_full.training_setup(args)
     accum_counter_full = 0
-    if args.half_maps:
+    if train_halves:
         gaussian_half1 = GaussianModel()
         gaussian_half1.initialize_gaussians_random(P=args.num_points)
         gaussian_half1.training_setup(args)
@@ -374,29 +457,55 @@ def main(args):
             f"Given value must be an integer or the label 'auto'!"
         )
 
+    # FSCs are computed in a background process while training continues. Each one starts
+    # once both the full map and the half-maps of that epoch (or "final") are available.
+    fsc_executor = None
+    fsc_jobs = []
+    full_volumes, half_volumes = {}, {}
+    if args.half_maps and args.fsc_vals and role != "halves":
+        # two workers, so the last epoch's FSC and the final one run side by side
+        fsc_executor = ProcessPoolExecutor(max_workers=2, mp_context=mp.get_context("spawn"))
+
+    def submit_ready_fscs():
+        for key in [k for k in full_volumes if k in half_volumes]:
+            suffix = "" if key == "final" else f".{key}"
+            fsc_jobs.append(fsc_executor.submit(
+                fsc_worker,
+                args.seed + (args.num_epochs if key == "final" else key),
+                full_volumes.pop(key),
+                *half_volumes.pop(key),
+                apix=Apix,
+                out_file=os.path.join(args.outdir, f"fsc-vals{suffix}.txt"),
+                plot_file=os.path.join(args.outdir, f"fsc-plot{suffix}.png"),
+            ))
+
+    def receive_half_maps(wait_for=None):
+        """Store the half-maps sent by the half-map process, waiting for `wait_for` if given."""
+        while True:
+            try:
+                key, volume_a, volume_b = half_maps_queue.get(block=wait_for is not None, timeout=10)
+            except queue.Empty:
+                if wait_for is None:
+                    return
+                if not half_maps_worker.is_alive():
+                    raise RuntimeError(
+                        f"The half-map process stopped (exit code {half_maps_worker.exitcode}); see run.log"
+                    )
+                continue
+            half_volumes[key] = (volume_a, volume_b)
+            if key == wait_for:
+                return
+
+    projmatrix = getProjectionMatrix(-0.5, 0.5, -0.5, 0.5, -0.5, 0.5, type="cryoem").to(device)
+    volume_full = volume_half1 = volume_half2 = None
+
     # Start training
     for epoch in range(args.num_epochs):
         t1 = time.time()
-        for i, ii in enumerate(img_iterator):
+        images = prepare_images(img_iterator, data, lattice, posetracker, ctf_params, window, args, device)
+        for i, (ii, r, gt_image, ctf_mul) in enumerate(images):
             if i % log_interval == 0:
                 logger.info(f"fimage {ii} — {(i / img_count * 100):.1f}% done")
-
-            # Input data
-            r, t = posetracker.get_pose(ii)
-            ff = data.get_tilt(ii) if args.tilt else data[ii]
-            assert isinstance(ff, tuple)
-            ff = ff[0].to(device)
-            ctf_mul = 1
-
-            if ctf_params is not None:
-                freqs = lattice.freqs2d / ctf_params[ii, 0]
-                c = ctf.compute_ctf(freqs, *ctf_params[ii, 1:]).view((D,D))
-                ctf_mul = c.view((D,D))
-
-            if t is not None:
-                ff = lattice.translate_ht(
-                    ff.view(1, -1), t.view(1, 1, 2)
-                ).view((D, D))
 
             if args.tilt:
                 tilt_idxs = torch.tensor([ii]).to(device)
@@ -405,48 +514,40 @@ def main(args):
                 ]
                 ctf_mul *= dose_filters[lattice_mask]
 
-            # Move to real space
-            gt_image = fft.iht2_center(ff[0:-1, 0:-1].detach())
-
-            if args.window and window is not None:
-                gt_image *= window
-
             # Render projections
-            viewmatrix = torch.eye(4)
+            viewmatrix = torch.eye(4, device=device)
             viewmatrix[:3, :3] = r
-            viewmatrix = viewmatrix.cuda()
-            projmatrix = getProjectionMatrix(-0.5, 0.5, -0.5, 0.5, -0.5, 0.5, type="cryoem")
-            projmatrix = projmatrix.cuda()
-            render_pkg = render(gaussian_full,
-                                D-1,
-                                D-1,
-                                viewmatrix,
-                                projmatrix)
-                    
-            proj_full, viewspace_point_tensor, visibility_filter, radii = render_pkg["rendered_image"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
-            if i % 10000 == 0:
-                plt.matshow(gt_image.detach().squeeze().cpu().numpy())
-                plt.colorbar()
-                plt.savefig(os.path.join(args.outdir, "gt_image.png"))
-                plt.close()
+            if train_full:
+                render_pkg = render(gaussian_full,
+                                    D-1,
+                                    D-1,
+                                    viewmatrix,
+                                    projmatrix)
 
-                plt.matshow(proj_full.detach().squeeze().cpu().numpy())
-                plt.colorbar()
-                plt.savefig(os.path.join(args.outdir, "reconstructed.png"))
-                plt.close()
+                proj_full, viewspace_point_tensor, visibility_filter, radii = render_pkg["rendered_image"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
+                if i % 10000 == 0:
+                    plt.matshow(gt_image.detach().squeeze().cpu().numpy())
+                    plt.colorbar()
+                    plt.savefig(os.path.join(args.outdir, "gt_image.png"))
+                    plt.close()
 
-            # Apply CTF
-            proj_full = apply_ctf_centered(proj_full, ctf_mul[0:-1, 0:-1])
+                    plt.matshow(proj_full.detach().squeeze().cpu().numpy())
+                    plt.colorbar()
+                    plt.savefig(os.path.join(args.outdir, "reconstructed.png"))
+                    plt.close()
 
-            # Optimization
-            loss_full = mse_loss(proj_full.squeeze(), gt_image.squeeze())
-            loss_full.backward()
+                # Apply CTF
+                proj_full = apply_ctf_centered(proj_full, ctf_mul[0:-1, 0:-1])
 
-            gaussian_full.optimizer.step()
-            gaussian_full.optimizer.zero_grad(set_to_none=True)
+                # Optimization
+                loss_full = mse_loss(proj_full.squeeze(), gt_image.squeeze())
+                loss_full.backward()
+
+                gaussian_full.optimizer.step()
+                gaussian_full.optimizer.zero_grad(set_to_none=True)
 
             # Process half maps
-            if args.half_maps:
+            if train_halves:
                 if ii % 2 == 0:
                     render_pkg = render(gaussian_half1,
                                 D-1,
@@ -482,66 +583,78 @@ def main(args):
             f"in {td:.2f}s ({(td / img_count):4f}s per image)"
         )
 
-        volume_full = gaussian_full.generate_volume(D=D, extent=0.5, norm=data.norm).cpu()
-        vol_fl = os.path.join(args.outdir, "gaussian.{}.mrc".format(epoch))
-        write_mrc(vol_fl, np.array(volume_full).astype("float32"), Apix=Apix)
-        gau_fl = os.path.join(args.outdir, "gaussian.{}.ply".format(epoch))
-        gaussian_full.save_ply(gau_fl)
+        if train_full:
+            volume_full = gaussian_full.generate_volume(D=D, extent=0.5, norm=data.norm).cpu()
+            vol_fl = os.path.join(args.outdir, "gaussian.{}.mrc".format(epoch))
+            write_mrc(vol_fl, np.array(volume_full).astype("float32"), Apix=Apix)
+            gau_fl = os.path.join(args.outdir, "gaussian.{}.ply".format(epoch))
+            gaussian_full.save_ply(gau_fl)
 
         # Create the half-maps, calculate the FSC curve between them, and save both to file
-        if args.half_maps:
+        if train_halves:
             volume_half1 = gaussian_half1.generate_volume(D=D, extent=0.5, norm=data.norm).cpu()
             volume_half2 = gaussian_half2.generate_volume(D=D, extent=0.5, norm=data.norm).cpu()
             half_fl1 = os.path.join(args.outdir, "half_map_a.{}.mrc".format(epoch))
             half_fl2 = os.path.join(args.outdir, "half_map_b.{}.mrc".format(epoch))
             write_mrc(half_fl1, np.array(volume_half1).astype("float32"), Apix=Apix)
             write_mrc(half_fl2, np.array(volume_half2).astype("float32"), Apix=Apix)
+            if role == "halves" and args.fsc_vals:
+                half_maps_queue.put((epoch, volume_half1, volume_half2))
+            elif fsc_executor is not None:
+                half_volumes[epoch] = (volume_half1, volume_half2)
 
-            if args.fsc_vals:
-                out_file = os.path.join(args.outdir, "fsc-vals.{}.txt".format(epoch))
-                plot_file = os.path.join(args.outdir, "fsc-plot.{}.png".format(epoch))
-                _ = calculate_cryosparc_fscs(
-                    volume_full,
-                    volume_half1,
-                    volume_half2,
-                    apix=Apix,
-                    out_file=out_file,
-                    plot_file=plot_file,
-                )
+        if fsc_executor is not None:
+            full_volumes[epoch] = volume_full
+            if role == "full":
+                receive_half_maps()
+            submit_ready_fscs()
 
         # Update learning rate
-        gaussian_full.update_learning_rate()
-        gaussian_half1.update_learning_rate()
-        gaussian_half2.update_learning_rate()
+        if train_full:
+            gaussian_full.update_learning_rate()
+        if train_halves:
+            gaussian_half1.update_learning_rate()
+            gaussian_half2.update_learning_rate()
 
         if args.shuffle:
             random.shuffle(img_iterator)
 
-    # Final evaluation
-    volume_full = gaussian_full.generate_volume(D=D, extent=0.5, norm=data.norm).cpu()
-    vol_fl = os.path.join(args.outdir, "gaussian.mrc")
-    write_mrc(vol_fl, np.array(volume_full).astype("float32"), Apix=Apix)
+    # Final evaluation. The Gaussians don't change after the last epoch, so its
+    # volumes are reused instead of being generated again.
+    if train_full:
+        if volume_full is None:
+            volume_full = gaussian_full.generate_volume(D=D, extent=0.5, norm=data.norm).cpu()
+        vol_fl = os.path.join(args.outdir, "gaussian.mrc")
+        write_mrc(vol_fl, np.array(volume_full).astype("float32"), Apix=Apix)
 
     # Create the half-maps, calculate the FSC curve between them, and save both to file
-    if args.half_maps:
-        volume_half1 = gaussian_half1.generate_volume(D=D, extent=0.5, norm=data.norm).cpu()
-        volume_half2 = gaussian_half2.generate_volume(D=D, extent=0.5, norm=data.norm).cpu()
+    if train_halves:
+        if volume_half1 is None:
+            volume_half1 = gaussian_half1.generate_volume(D=D, extent=0.5, norm=data.norm).cpu()
+            volume_half2 = gaussian_half2.generate_volume(D=D, extent=0.5, norm=data.norm).cpu()
         half_fl1 = os.path.join(args.outdir, "half_map_a.mrc")
         half_fl2 = os.path.join(args.outdir, "half_map_b.mrc")
         write_mrc(half_fl1, np.array(volume_half1).astype("float32"), Apix=Apix)
         write_mrc(half_fl2, np.array(volume_half2).astype("float32"), Apix=Apix)
+        if role == "halves" and args.fsc_vals:
+            half_maps_queue.put(("final", volume_half1, volume_half2))
+        elif fsc_executor is not None:
+            half_volumes["final"] = (volume_half1, volume_half2)
 
-        if args.fsc_vals:
-            out_file = os.path.join(args.outdir, "fsc-vals.txt")
-            plot_file = os.path.join(args.outdir, "fsc-plot.png")
-            _ = calculate_cryosparc_fscs(
-                volume_full,
-                volume_half1,
-                volume_half2,
-                apix=Apix,
-                out_file=out_file,
-                plot_file=plot_file,
-            )
+    if fsc_executor is not None:
+        full_volumes["final"] = volume_full
+        if role == "full":
+            receive_half_maps(wait_for="final")
+        submit_ready_fscs()
+        logger.info(f"Waiting for {sum(not job.done() for job in fsc_jobs)} FSC calculation(s) to finish")
+        for job in fsc_jobs:
+            job.result()  # re-raises any error from the worker
+        fsc_executor.shutdown()
+
+    if half_maps_worker is not None:
+        half_maps_worker.join()
+        if half_maps_worker.exitcode != 0:
+            raise RuntimeError(f"The half-map process failed (exit code {half_maps_worker.exitcode}); see run.log")
 
 if __name__ == "__main__":
     import argparse
